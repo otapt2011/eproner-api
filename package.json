@@ -1,0 +1,11 @@
+{
+  "name": "cors-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Minimal CORS proxy for Vercel using pure Node.js",
+  "main": "api/proxy.js",
+  "scripts": {},
+  "engines": {
+    "node": ">=18"
+  }
+}
