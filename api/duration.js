@@ -1,11 +1,11 @@
-// api/video-duration.js
+// api/duration.js
 const https = require('https');
 const http = require('http');
 const { URL } = require('url');
 
-const REQUEST_TIMEOUT = 20000;
-const CHUNK_SIZE = 1024 * 1024; // 1 MB
-const FULL_DOWNLOAD_LIMIT = 5 * 1024 * 1024; // 5 MB
+const REQUEST_TIMEOUT = 25000;
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB
+const FULL_DOWNLOAD_LIMIT = 10 * 1024 * 1024; // 10 MB
 
 module.exports = async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -43,7 +43,7 @@ module.exports = async (req, res) => {
                 headers: {
                     'Range': `bytes=${start}-${end}`,
                     'Accept-Encoding': 'identity',
-                    'User-Agent': 'Mozilla/5.0 (compatible; VideoDurationProxy/2.0)',
+                    'User-Agent': 'Mozilla/5.0 (compatible; DurationProxy/3.0)',
                 },
                 timeout: REQUEST_TIMEOUT,
             };
@@ -65,38 +65,32 @@ module.exports = async (req, res) => {
         });
     }
 
-    function parseDuration(buffer) {
-        // Search for 'moov' box anywhere in buffer
-        let offset = 0;
-        while (offset + 8 <= buffer.length) {
-            const size = buffer.readUInt32BE(offset);
-            const type = buffer.toString('ascii', offset + 4, offset + 8);
-            if (type === 'moov') {
-                const moovStart = offset + 8;
-                const moovEnd = offset + size;
-                let childOffset = moovStart;
-                while (childOffset + 8 <= moovEnd && childOffset < buffer.length) {
-                    const childSize = buffer.readUInt32BE(childOffset);
-                    const childType = buffer.toString('ascii', childOffset + 4, childOffset + 8);
-                    if (childType === 'mvhd') {
-                        const version = buffer.readUInt8(childOffset + 8);
-                        let timescale, duration;
-                        if (version === 1) {
-                            timescale = buffer.readUInt32BE(childOffset + 20);
-                            duration = buffer.readBigUInt64BE(childOffset + 24);
-                        } else {
-                            timescale = buffer.readUInt32BE(childOffset + 16);
-                            duration = buffer.readUInt32BE(childOffset + 20);
-                        }
-                        if (timescale > 0) {
-                            return Number(duration) / timescale;
-                        }
-                    }
-                    childOffset += childSize;
-                }
-                break; // moov found but mvhd maybe missing
+    // Search for "mvhd" and parse duration based on version
+    function parseMvhd(buffer) {
+        const signature = Buffer.from('mvhd', 'ascii');
+        let index = buffer.indexOf(signature);
+        while (index !== -1) {
+            // Need at least 4 bytes before index for size, but we can use surrounding context
+            // Actually we need timescale and duration relative to mvhd start, so we need to know the offset of mvhd within its parent.
+            // But we can read directly: version is at index+4, flags at index+5..7, creation at +8, modification at +12, timescale at +16, duration at +20 (for v0)
+            const version = buffer.readUInt8(index + 4);
+            let timescale, duration;
+            if (version === 1) {
+                // 64-bit duration: timescale at +20, duration at +24
+                if (index + 32 > buffer.length) break;
+                timescale = buffer.readUInt32BE(index + 20);
+                duration = buffer.readBigUInt64BE(index + 24);
+            } else {
+                // version 0
+                if (index + 24 > buffer.length) break;
+                timescale = buffer.readUInt32BE(index + 16);
+                duration = buffer.readUInt32BE(index + 20);
             }
-            offset += size;
+            if (timescale > 0 && duration > 0) {
+                return Number(duration) / timescale;
+            }
+            // Continue searching
+            index = buffer.indexOf(signature, index + 1);
         }
         return null;
     }
@@ -104,13 +98,13 @@ module.exports = async (req, res) => {
     try {
         // 1. First chunk
         let buffer = await fetchRange(0, CHUNK_SIZE - 1);
-        let duration = parseDuration(buffer);
+        let duration = parseMvhd(buffer);
         if (duration !== null) {
             res.json({ duration });
             return;
         }
 
-        // 2. Last chunk (if file size can be determined)
+        // 2. Last chunk
         let fileSize;
         try {
             const headRes = await new Promise((resolve, reject) => {
@@ -127,30 +121,17 @@ module.exports = async (req, res) => {
         if (fileSize && fileSize > CHUNK_SIZE) {
             const start = fileSize - CHUNK_SIZE;
             buffer = await fetchRange(start, fileSize - 1);
-            duration = parseDuration(buffer);
+            duration = parseMvhd(buffer);
             if (duration !== null) {
                 res.json({ duration });
                 return;
             }
-
-            // 3. Binary search middle chunks (try up to 3 middle positions)
-            for (let i = 1; i <= 3; i++) {
-                const mid = Math.floor((fileSize * i) / 4);
-                const chunkStart = Math.max(0, mid - Math.floor(CHUNK_SIZE / 2));
-                const chunkEnd = Math.min(fileSize - 1, chunkStart + CHUNK_SIZE - 1);
-                buffer = await fetchRange(chunkStart, chunkEnd);
-                duration = parseDuration(buffer);
-                if (duration !== null) {
-                    res.json({ duration });
-                    return;
-                }
-            }
         }
 
-        // 4. Fallback: full download if small
+        // 3. Full download if file is small enough
         if (!fileSize || fileSize <= FULL_DOWNLOAD_LIMIT) {
             buffer = await fetchRange(0, FULL_DOWNLOAD_LIMIT);
-            duration = parseDuration(buffer);
+            duration = parseMvhd(buffer);
             if (duration !== null) {
                 res.json({ duration });
                 return;
