@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/video-sources.js": {
+      "maxDuration": 30
+    }
+  }
+}
