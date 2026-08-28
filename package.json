@@ -10,6 +10,8 @@
   },
   "dependencies": {
     "@sparticuz/chromium": "^121.0.0",
-    "puppeteer-core": "^21.0.0"
+    "puppeteer-core": "^21.0.0",
+    "chrome-aws-lambda": "^10.1.0",
+    "puppeteer-core": "^10.1.0"
   }
 }
