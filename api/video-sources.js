@@ -1,6 +1,6 @@
 // api/video-sources.js
 // Combines scraping hash from embed page and fetching XHR video sources.
-// Also captures cookies from embed page and forwards them to XHR.
+// Properly handles cookies and uses embed=true.
 // Usage: /api/video-sources?id=VIDEO_ID
 
 const https = require('https');
@@ -13,14 +13,14 @@ const CORS_HEADERS = {
     'Access-Control-Allow-Headers': '*',
 };
 
-// XHR endpoint parameters (same as observed in browser)
+// XHR parameters – note embed: 'true'
 const XHR_PARAMS = {
     domain: 'www.eporner.com',
     pixelRatio: '3',
     playerWidth: '0',
     playerHeight: '0',
     fallback: 'true',
-    embed: 'true',
+    embed: 'true',               // <-- changed to true
     supportedFormats: 'hls,dash,vp9,mp4',
     _: Date.now().toString(),
 };
@@ -42,7 +42,7 @@ module.exports = async (req, res) => {
         return;
     }
 
-    // Helper to perform HTTP GET and return { body, cookies } where cookies is an array of strings
+    // Helper to perform HTTP GET and return body + parsed cookies (key=value pairs)
     function fetchWithCookies(url, cookieHeader = '', extraHeaders = {}) {
         return new Promise((resolve, reject) => {
             const transport = url.startsWith('https') ? https : http;
@@ -67,7 +67,12 @@ module.exports = async (req, res) => {
                     if (response.statusCode >= 200 && response.statusCode < 400) {
                         const body = Buffer.concat(chunks).toString('utf8');
                         const setCookies = response.headers['set-cookie'] || [];
-                        resolve({ body, cookies: setCookies });
+                        // Parse each Set-Cookie header: take the part before ';'
+                        const cookiePairs = setCookies.map(cookie => {
+                            const parts = cookie.split(';');
+                            return parts[0].trim(); // e.g., "sessionid=abc"
+                        }).filter(pair => pair.includes('='));
+                        resolve({ body, cookies: cookiePairs });
                     } else {
                         reject(new Error(`HTTP ${response.statusCode}`));
                     }
@@ -80,7 +85,7 @@ module.exports = async (req, res) => {
     }
 
     try {
-        // 1. Fetch embed page
+        // 1. Fetch embed page to get hash and cookies
         const embedUrl = `https://www.eporner.com/embed/${videoId}`;
         const embedResponse = await fetchWithCookies(embedUrl);
 
@@ -115,7 +120,7 @@ module.exports = async (req, res) => {
             xhrUrl.searchParams.set(key, value);
         }
 
-        // 3. Prepare cookies from embed response (join them with '; ')
+        // 3. Prepare cookie header from parsed pairs
         const cookieHeader = embedResponse.cookies.join('; ');
 
         // 4. Fetch XHR with cookies and browser-like headers
