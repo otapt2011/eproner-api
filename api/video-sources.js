@@ -1,6 +1,6 @@
 // api/video-sources.js
-// Combines scraping hash from embed page and fetching XHR video sources.
-// Properly handles cookies and uses embed=true.
+// Scrapes the main video page to get the correct hash, then fetches XHR.
+// Uses embed=false and proper cookie handling.
 // Usage: /api/video-sources?id=VIDEO_ID
 
 const https = require('https');
@@ -13,14 +13,14 @@ const CORS_HEADERS = {
     'Access-Control-Allow-Headers': '*',
 };
 
-// XHR parameters – note embed: 'true'
+// XHR parameters – embed is false (main site context)
 const XHR_PARAMS = {
     domain: 'www.eporner.com',
     pixelRatio: '3',
     playerWidth: '0',
     playerHeight: '0',
     fallback: 'true',
-    embed: 'true',               // <-- changed to true
+    embed: 'false',               // changed back to false
     supportedFormats: 'hls,dash,vp9,mp4',
     _: Date.now().toString(),
 };
@@ -42,8 +42,8 @@ module.exports = async (req, res) => {
         return;
     }
 
-    // Helper to perform HTTP GET and return body + parsed cookies (key=value pairs)
-    function fetchWithCookies(url, cookieHeader = '', extraHeaders = {}) {
+    // Helper to fetch a URL and return body, cookies (as name=value pairs)
+    function fetchUrl(url, cookieHeader = '', extraHeaders = {}) {
         return new Promise((resolve, reject) => {
             const transport = url.startsWith('https') ? https : http;
             const options = {
@@ -67,11 +67,7 @@ module.exports = async (req, res) => {
                     if (response.statusCode >= 200 && response.statusCode < 400) {
                         const body = Buffer.concat(chunks).toString('utf8');
                         const setCookies = response.headers['set-cookie'] || [];
-                        // Parse each Set-Cookie header: take the part before ';'
-                        const cookiePairs = setCookies.map(cookie => {
-                            const parts = cookie.split(';');
-                            return parts[0].trim(); // e.g., "sessionid=abc"
-                        }).filter(pair => pair.includes('='));
+                        const cookiePairs = setCookies.map(cookie => cookie.split(';')[0].trim()).filter(p => p.includes('='));
                         resolve({ body, cookies: cookiePairs });
                     } else {
                         reject(new Error(`HTTP ${response.statusCode}`));
@@ -85,11 +81,25 @@ module.exports = async (req, res) => {
     }
 
     try {
-        // 1. Fetch embed page to get hash and cookies
-        const embedUrl = `https://www.eporner.com/embed/${videoId}`;
-        const embedResponse = await fetchWithCookies(embedUrl);
+        // 1. Try to fetch main video page: https://www.eporner.com/video-{id}/
+        let mainPageUrl = `https://www.eporner.com/video-${videoId}/`;
+        let mainResponse;
+        try {
+            mainResponse = await fetchUrl(mainPageUrl);
+        } catch (err) {
+            // Fallback: fetch embed page to get canonical URL from EP.video.player.url
+            const embedUrl = `https://www.eporner.com/embed/${videoId}`;
+            const embedResponse = await fetchUrl(embedUrl);
+            const urlMatch = embedResponse.body.match(/EP\.video\.player\.url\s*=\s*['"]([^'"]+)['"]/i);
+            if (urlMatch && urlMatch[1]) {
+                mainPageUrl = urlMatch[1];
+                mainResponse = await fetchUrl(mainPageUrl);
+            } else {
+                throw new Error('Could not find main video page URL');
+            }
+        }
 
-        // Extract hash
+        // Extract hash from main page HTML
         const hashPatterns = [
             /EP\.video\.player\.hash\s*=\s*['"]([a-f0-9]{16,})['"]/i,
             /["']hash["']\s*[:=]\s*['"]([a-f0-9]{16,})['"]/i,
@@ -99,7 +109,7 @@ module.exports = async (req, res) => {
 
         let hash = null;
         for (const regex of hashPatterns) {
-            const match = embedResponse.body.match(regex);
+            const match = mainResponse.body.match(regex);
             if (match && match[1]) {
                 hash = match[1];
                 break;
@@ -109,29 +119,29 @@ module.exports = async (req, res) => {
         if (!hash) {
             res.statusCode = 404;
             res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ error: 'Hash not found in embed page' }));
+            res.end(JSON.stringify({ error: 'Hash not found in main page' }));
             return;
         }
 
-        // 2. Build XHR URL
+        // 2. Build XHR URL with hash
         const xhrUrl = new URL(`https://www.eporner.com/xhr/video/${videoId}`);
         xhrUrl.searchParams.set('hash', hash);
         for (const [key, value] of Object.entries(XHR_PARAMS)) {
             xhrUrl.searchParams.set(key, value);
         }
 
-        // 3. Prepare cookie header from parsed pairs
-        const cookieHeader = embedResponse.cookies.join('; ');
+        // 3. Prepare cookie header from main page cookies
+        const cookieHeader = mainResponse.cookies.join('; ');
 
         // 4. Fetch XHR with cookies and browser-like headers
-        const xhrResponse = await fetchWithCookies(xhrUrl.toString(), cookieHeader, {
+        const xhrResponse = await fetchUrl(xhrUrl.toString(), cookieHeader, {
             'Accept': 'application/json, text/plain, */*',
             'X-Requested-With': 'XMLHttpRequest',
-            'Referer': embedUrl,
+            'Referer': mainPageUrl,
             'Origin': 'https://www.eporner.com',
         });
 
-        // 5. Parse and return JSON
+        // 5. Parse JSON
         let jsonData;
         try {
             jsonData = JSON.parse(xhrResponse.body);
